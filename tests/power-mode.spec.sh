@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+power_mode="$repo_root/power-mode"
+controller="$repo_root/pseudo_screensaver_control.sh"
+nosleep_timeout_helper="$repo_root/nosleep_timeout.sh"
+
+assert_contains() {
+  local text="$1"
+  local pattern="$2"
+  local label="$3"
+
+  if [[ "$text" != *"$pattern"* ]]; then
+    printf 'Assertion failed: %s\n' "$label" >&2
+    printf 'Missing pattern: %s\n' "$pattern" >&2
+    printf 'Actual:\n%s\n' "$text" >&2
+    exit 1
+  fi
+}
+
+assert_not_contains() {
+  local text="$1"
+  local pattern="$2"
+  local label="$3"
+
+  if [[ "$text" == *"$pattern"* ]]; then
+    printf 'Assertion failed: %s\n' "$label" >&2
+    printf 'Unexpected pattern: %s\n' "$pattern" >&2
+    printf 'Actual:\n%s\n' "$text" >&2
+    exit 1
+  fi
+}
+
+temporary_dir="$(mktemp -d)"
+POWER_MODE_STATE_DIR="$temporary_dir/state"
+export POWER_MODE_STATE_DIR
+cleanup() {
+  POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+    "$controller" stop >/dev/null 2>&1 || true
+  rm -rf "$temporary_dir"
+}
+trap cleanup EXIT
+
+if [ ! -x "$nosleep_timeout_helper" ]; then
+  echo 'Assertion failed: the nosleep timeout helper is not executable' >&2
+  exit 1
+fi
+
+for retired_mode in remote unsleep; do
+  if "$power_mode" "$retired_mode" --dry-run \
+    >"$temporary_dir/retired-mode.out" 2>&1; then
+    printf 'Assertion failed: retired mode is still accepted: %s\n' \
+      "$retired_mode" >&2
+    exit 1
+  fi
+done
+
+POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" "$controller" build >/dev/null
+test -x "$temporary_dir/cache/pseudo-screensaver"
+
+rebuild_marker="$temporary_dir/rebuild-marker"
+touch "$rebuild_marker"
+sleep 1
+POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" "$controller" rebuild >/dev/null
+if [ ! "$temporary_dir/cache/pseudo-screensaver" -nt "$rebuild_marker" ]; then
+  echo 'Assertion failed: rebuild did not replace the cached binary' >&2
+  exit 1
+fi
+
+fake_launchctl="$temporary_dir/launchctl"
+launchctl_trace="$temporary_dir/launchctl.trace"
+# shellcheck disable=SC2016
+# The generated script expands these variables at runtime.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf '\''%s\n'\'' "$*" >>"$POWER_MODE_LAUNCHCTL_TRACE"' \
+  'exit 0' \
+  >"$fake_launchctl"
+chmod +x "$fake_launchctl"
+POWER_MODE_LAUNCHCTL="$fake_launchctl" \
+  POWER_MODE_LAUNCHCTL_TRACE="$launchctl_trace" \
+  POWER_MODE_PSEUDO_LEGACY_LAUNCHD_LABEL=com.example.legacy-power-mode \
+  POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+  "$controller" stop >/dev/null
+assert_contains \
+  "$(<"$launchctl_trace")" \
+  'list com.example.legacy-power-mode' \
+  'stop checks for an obsolete launchd pseudo-screen-saver job'
+assert_contains \
+  "$(<"$launchctl_trace")" \
+  'remove com.example.legacy-power-mode' \
+  'stop removes an obsolete launchd pseudo-screen-saver job'
+
+fake_m1ddc="$temporary_dir/m1ddc"
+m1ddc_trace="$temporary_dir/m1ddc.trace"
+# shellcheck disable=SC2016
+# The generated script expands these variables at runtime.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf '\''%s\n'\'' "$*" >>"$POWER_MODE_M1DDC_TRACE"' \
+  >"$fake_m1ddc"
+chmod +x "$fake_m1ddc"
+printf '%s\n' 'uuid=11111111-2222-3333-4444-555555555555 50' \
+  >"$temporary_dir/cache/pseudo-screensaver.brightness-state"
+POWER_MODE_M1DDC="$fake_m1ddc" \
+  POWER_MODE_M1DDC_TRACE="$m1ddc_trace" \
+  POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+  "$controller" stop >/dev/null
+assert_contains \
+  "$(<"$m1ddc_trace")" \
+  'display uuid=11111111-2222-3333-4444-555555555555 set luminance 50' \
+  'stop restores a persisted external-display brightness value'
+if [ -e "$temporary_dir/cache/pseudo-screensaver.brightness-state" ]; then
+  echo 'Assertion failed: restored brightness state was not removed' >&2
+  exit 1
+fi
+
+controller_trace="$(
+  POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+    bash -x "$controller" start 3600 2>&1
+)"
+assert_contains \
+  "$controller_trace" \
+  '/usr/bin/caffeinate -dims' \
+  'the pseudo screen saver keeps the Mac awake with caffeinate'
+if [ "$(sed -n '1p' "$temporary_dir/cache/pseudo-screensaver.runner")" != "caffeinate" ]; then
+  echo 'Assertion failed: the controller did not record the caffeinate runner' >&2
+  exit 1
+fi
+pseudo_screensaver_pid="$(sed -n '1p' "$temporary_dir/cache/pseudo-screensaver.pid")"
+POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+  "$controller" stop >/dev/null
+if kill -0 "$pseudo_screensaver_pid" 2>/dev/null; then
+  echo 'Assertion failed: stop left the pseudo screen saver running' >&2
+  exit 1
+fi
+
+status_bin="$temporary_dir/status-bin"
+mkdir -p "$status_bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'exit 0' \
+  >"$status_bin/pmset"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'echo 900' \
+  >"$status_bin/defaults"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  "if [ \"\$1\" = \"status\" ]; then" \
+  '  echo stopped' \
+  'fi' \
+  >"$status_bin/pseudo-screensaver"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'echo screenLock is off' \
+  >"$status_bin/sysadminctl"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'echo SleepDisabled = No' \
+  >"$status_bin/ioreg"
+chmod +x "$status_bin"/*
+
+status_output="$(
+  PATH="$status_bin:$PATH" \
+    POWER_MODE_STATE_DIR="$temporary_dir/status-state" \
+    PSEUDO_SCREENSAVER_CONTROLLER="$status_bin/pseudo-screensaver" \
+    "$power_mode"
+)"
+assert_contains \
+  "$status_output" \
+  'Power mode: unknown' \
+  'status prints only the detected mode by default'
+assert_not_contains \
+  "$status_output" \
+  'pmset:' \
+  'status omits pmset details by default'
+
+status_detail_output="$(
+  PATH="$status_bin:$PATH" \
+    POWER_MODE_STATE_DIR="$temporary_dir/status-state" \
+    PSEUDO_SCREENSAVER_CONTROLLER="$status_bin/pseudo-screensaver" \
+    "$power_mode" status --detail
+)"
+assert_contains \
+  "$status_detail_output" \
+  'pmset:' \
+  'status --detail prints pmset details'
+assert_contains \
+  "$status_detail_output" \
+  'screensaver:' \
+  'status --detail prints screen saver details'
+
+if PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+  "$power_mode" normal --detail --dry-run \
+  >"$temporary_dir/invalid-detail-mode.out" 2>&1; then
+  echo 'Assertion failed: normal accepted the status-only detail flag' >&2
+  exit 1
+fi
+assert_contains \
+  "$(<"$temporary_dir/invalid-detail-mode.out")" \
+  '--detail は status でのみ指定できます。' \
+  'the detail flag is rejected outside status mode'
+
+nolock_output="$(
+  PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" nolock --dry-run
+)"
+assert_contains \
+  "$nolock_output" \
+  'defaults -currentHost write com.apple.screensaver idleTime -int 0' \
+  'nolock disables the macOS screen saver'
+assert_contains \
+  "$nolock_output" \
+  '/bin/echo start 300' \
+  'nolock starts the pseudo screen saver after five idle minutes'
+assert_not_contains \
+  "$nolock_output" \
+  'Current status' \
+  'nolock dry-run does not print status automatically'
+if [[ "$nolock_output" == *'sudo '* ]] ||
+  [[ "$nolock_output" == *'askForPassword'* ]] ||
+  [[ "$nolock_output" == *'sysadminctl'* ]]; then
+  printf 'Assertion failed: nolock still changes privileged or password settings\n%s\n' \
+    "$nolock_output" >&2
+  exit 1
+fi
+
+nolock_override_output="$(
+  PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" nolock --pseudo-screensaver-seconds 42 --dry-run
+)"
+assert_contains \
+  "$nolock_override_output" \
+  '/bin/echo start 42' \
+  'nolock accepts a pseudo screen saver delay in seconds'
+
+if PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+  "$power_mode" normal --pseudo-screensaver-seconds 42 --dry-run \
+  >"$temporary_dir/invalid-mode.out" 2>&1; then
+  echo 'Assertion failed: normal accepted the nolock-only delay flag' >&2
+  exit 1
+fi
+assert_contains \
+  "$(<"$temporary_dir/invalid-mode.out")" \
+  '--pseudo-screensaver-seconds は nolock でのみ指定できます。' \
+  'the delay flag is rejected outside nolock mode'
+
+if PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+  "$power_mode" nolock --pseudo-screensaver-seconds= --dry-run \
+  >"$temporary_dir/invalid-seconds.out" 2>&1; then
+  echo 'Assertion failed: nolock accepted an empty delay' >&2
+  exit 1
+fi
+assert_contains \
+  "$(<"$temporary_dir/invalid-seconds.out")" \
+  '--pseudo-screensaver-seconds は 0 以上の整数で指定してください' \
+  'an empty delay is rejected'
+
+normal_output="$(
+  POWER_MODE_STATE_DIR="$temporary_dir/state" \
+    PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" normal --dry-run
+)"
+assert_contains \
+  "$normal_output" \
+  '/bin/echo stop' \
+  'normal stops the pseudo screen saver'
+assert_not_contains \
+  "$normal_output" \
+  'Current status' \
+  'normal dry-run does not print status automatically'
+if [[ "$normal_output" == *'sudo '* ]] ||
+  [[ "$normal_output" == *'askForPassword'* ]] ||
+  [[ "$normal_output" == *'sysadminctl'* ]]; then
+  printf 'Assertion failed: normal still changes privileged or password settings\n%s\n' \
+    "$normal_output" >&2
+  exit 1
+fi
+
+if POWER_MODE_STATE_DIR="$temporary_dir/state" \
+  PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+  "$power_mode" nosleep --dry-run \
+  >"$temporary_dir/nosleep-without-duration.out" 2>&1; then
+  echo 'Assertion failed: nosleep accepted a missing duration' >&2
+  exit 1
+fi
+assert_contains \
+  "$(<"$temporary_dir/nosleep-without-duration.out")" \
+  'nosleep には継続時間（分）が必要です。' \
+  'nosleep requires an explicit timeout'
+
+nosleep_output="$(
+  POWER_MODE_STATE_DIR="$temporary_dir/state" \
+    PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" nosleep 120 --dry-run
+)"
+assert_contains \
+  "$nosleep_output" \
+  '/bin/echo start 300' \
+  'nosleep includes the nolock pseudo screen saver behavior'
+assert_contains \
+  "$nosleep_output" \
+  'sudo pmset -a powermode 1' \
+  'nosleep enables low power mode'
+assert_contains \
+  "$nosleep_output" \
+  'sudo pmset -a disablesleep 1' \
+  'nosleep disables all system sleep'
+assert_contains \
+  "$nosleep_output" \
+  'sudo -b' \
+  'nosleep starts its privileged timeout helper'
+assert_contains \
+  "$nosleep_output" \
+  'nosleep_timeout.sh 7200' \
+  'nosleep converts the requested minutes for its timeout helper'
+assert_contains \
+  "$nosleep_output" \
+  "$repo_root/power-mode" \
+  'nosleep timeout returns through the standalone power-mode entrypoint'
+
+mkdir -p "$temporary_dir/state"
+printf '%s\n%s\n' 'test-token' '9999999999' >"$temporary_dir/state/nosleep.state"
+mkdir -p "$temporary_dir/bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'echo '\''  "SleepDisabled" = Yes'\''' \
+  >"$temporary_dir/bin/ioreg"
+chmod +x "$temporary_dir/bin/ioreg"
+normal_from_nosleep_output="$(
+  PATH="$temporary_dir/bin:$PATH" \
+    POWER_MODE_STATE_DIR="$temporary_dir/state" \
+    PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" normal --dry-run
+)"
+assert_contains \
+  "$normal_from_nosleep_output" \
+  'sudo pmset -a disablesleep 0 powermode 0' \
+  'leaving nosleep restores system sleep and automatic power mode with privileges'
+
+nolock_from_nosleep_output="$(
+  PATH="$temporary_dir/bin:$PATH" \
+    POWER_MODE_STATE_DIR="$temporary_dir/state" \
+    PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" nolock --dry-run
+)"
+assert_contains \
+  "$nolock_from_nosleep_output" \
+  'sudo pmset -a disablesleep 0 powermode 0' \
+  'switching from nosleep to nolock restores system sleep and automatic power mode with privileges'
+
+assert_contains \
+  "$(<"$nosleep_timeout_helper")" \
+  '/usr/bin/pmset -a disablesleep 0 powermode 0' \
+  'the nosleep timeout restores system sleep and automatic power mode'
+
+rm -f "$temporary_dir/state/nosleep.state"
+nolock_after_nosleep_output="$(
+  POWER_MODE_STATE_DIR="$temporary_dir/state" \
+    PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" nolock --dry-run
+)"
+assert_not_contains \
+  "$nolock_after_nosleep_output" \
+  'sudo ' \
+  'normal and nolock remain password-free outside nosleep'
+
+setup_output="$(
+  PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
+    "$power_mode" setup --dry-run
+)"
+assert_contains \
+  "$setup_output" \
+  'sudo pmset -a sleep 30 displaysleep 20 disksleep 10' \
+  'setup applies the normal power settings once'
+assert_contains \
+  "$setup_output" \
+  '/bin/echo stop' \
+  'setup leaves the machine in normal mode'
+if [[ "$setup_output" == *'askForPassword'* ]] ||
+  [[ "$setup_output" == *'sysadminctl'* ]]; then
+  printf 'Assertion failed: setup still changes password settings\n%s\n' \
+    "$setup_output" >&2
+  exit 1
+fi
+
+echo 'power_mode tests passed.'
