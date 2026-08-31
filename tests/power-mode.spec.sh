@@ -117,6 +117,118 @@ if [ -e "$temporary_dir/cache/pseudo-screensaver.brightness-state" ]; then
   exit 1
 fi
 
+# shellcheck disable=SC2016
+# The generated script expands these variables at runtime.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf '\''%s\n'\'' "$*" >>"$POWER_MODE_M1DDC_TRACE"' \
+  'case "$*" in' \
+  '  "display uuid="*) exit 1 ;;' \
+  '  "set luminance 50") exit 0 ;;' \
+  'esac' \
+  'exit 1' \
+  >"$fake_m1ddc"
+chmod +x "$fake_m1ddc"
+: >"$m1ddc_trace"
+printf '%s\n' 'uuid=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 50' \
+  >"$temporary_dir/cache/pseudo-screensaver.brightness-state"
+fallback_restore_output="$(
+  POWER_MODE_M1DDC="$fake_m1ddc" \
+    POWER_MODE_M1DDC_TRACE="$m1ddc_trace" \
+    POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+    "$controller" stop 2>&1
+)"
+assert_contains \
+  "$(<"$m1ddc_trace")" \
+  'display uuid=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE set luminance 50' \
+  'restore first tries the persisted external-display UUID'
+assert_contains \
+  "$(<"$m1ddc_trace")" \
+  'set luminance 50' \
+  'restore falls back to 50 percent on the default external display'
+assert_contains \
+  "$fallback_restore_output" \
+  'Restored the default external display brightness to 50%.' \
+  'restore reports a successful default-display fallback'
+if [ -e "$temporary_dir/cache/pseudo-screensaver.brightness-state" ]; then
+  echo 'Assertion failed: fallback-restored brightness state was not removed' >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'exit 1' \
+  >"$fake_m1ddc"
+chmod +x "$fake_m1ddc"
+printf '%s\n' 'uuid=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 50' \
+  >"$temporary_dir/cache/pseudo-screensaver.brightness-state"
+failed_restore_output="$(
+  POWER_MODE_M1DDC="$fake_m1ddc" \
+    POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+    "$controller" stop 2>&1
+)"
+assert_contains \
+  "$failed_restore_output" \
+  'Warning: Failed to restore external display brightness; continuing.' \
+  'a total external-display restore failure does not block mode switching'
+if [ ! -e "$temporary_dir/cache/pseudo-screensaver.brightness-state" ]; then
+  echo 'Assertion failed: unrestored brightness state was removed' >&2
+  exit 1
+fi
+rm -f "$temporary_dir/cache/pseudo-screensaver.brightness-state"
+
+# shellcheck disable=SC2016
+# The generated script expands these variables at runtime.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf '\''%s\n'\'' "$*" >>"$POWER_MODE_M1DDC_TRACE"' \
+  'case "$*" in' \
+  '  "display uuid=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE set luminance 50") exit 0 ;;' \
+  '  "display uuid=11111111-2222-3333-4444-555555555555 set luminance 50") exit 1 ;;' \
+  '  "set luminance 50") exit 0 ;;' \
+  'esac' \
+  'exit 1' \
+  >"$fake_m1ddc"
+chmod +x "$fake_m1ddc"
+: >"$m1ddc_trace"
+printf '%s\n' \
+  'uuid=AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE 50' \
+  'uuid=11111111-2222-3333-4444-555555555555 50' \
+  >"$temporary_dir/cache/pseudo-screensaver.brightness-state"
+POWER_MODE_M1DDC="$fake_m1ddc" \
+  POWER_MODE_M1DDC_TRACE="$m1ddc_trace" \
+  POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+  "$controller" stop >/dev/null 2>&1
+assert_not_contains \
+  "$(<"$m1ddc_trace")" \
+  $'\nset luminance 50' \
+  'multiple-display restore does not treat the default display as every failed display'
+if [ "$(<"$temporary_dir/cache/pseudo-screensaver.brightness-state")" != \
+  'uuid=11111111-2222-3333-4444-555555555555 50' ]; then
+  echo 'Assertion failed: multiple-display restore did not retain only failed entries' >&2
+  exit 1
+fi
+rm -f "$temporary_dir/cache/pseudo-screensaver.brightness-state"
+
+printf '%s\n' 'invalid-state' \
+  >"$temporary_dir/cache/pseudo-screensaver.brightness-state"
+invalid_restore_output="$(
+  POWER_MODE_M1DDC="$fake_m1ddc" \
+    POWER_MODE_M1DDC_TRACE="$m1ddc_trace" \
+    POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
+    "$controller" stop 2>&1
+)"
+assert_contains \
+  "$invalid_restore_output" \
+  'Warning: Invalid brightness restore state:' \
+  'invalid brightness state does not block mode switching'
+if [ "$(<"$temporary_dir/cache/pseudo-screensaver.brightness-state")" != \
+  'invalid-state' ]; then
+  echo 'Assertion failed: invalid brightness state was changed' >&2
+  exit 1
+fi
+rm -f "$temporary_dir/cache/pseudo-screensaver.brightness-state"
+
 controller_trace="$(
   POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
     bash -x "$controller" start 3600 2>&1

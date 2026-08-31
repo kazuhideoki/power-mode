@@ -81,51 +81,71 @@ restore_external_brightness() {
   local uuid
   local brightness
   local extra
-  local failed=0
+  local failed_state_file
+  local total_entries=0
+  local failed_entries=0
 
   m1ddc="$(m1ddc_binary)"
   if [ -z "$m1ddc" ]; then
-    echo "External display brightness restore requires m1ddc." >&2
-    return 1
+    echo "Warning: External display brightness restore requires m1ddc; continuing." >&2
+    return 0
   fi
 
+  failed_state_file="${brightness_state_file}.tmp.$$"
+  rm -f "$failed_state_file"
+  : >"$failed_state_file"
+
   while read -r selector brightness extra; do
+    total_entries=$((total_entries + 1))
     case "$selector" in
     uuid=*) uuid="${selector#uuid=}" ;;
     *)
-      echo "Invalid brightness restore state: $brightness_state_file" >&2
-      return 1
+      rm -f "$failed_state_file"
+      echo "Warning: Invalid brightness restore state: $brightness_state_file; continuing." >&2
+      return 0
       ;;
     esac
     case "$uuid" in
     '' | *[!0-9A-Fa-f-]*)
-      echo "Invalid brightness restore state: $brightness_state_file" >&2
-      return 1
+      rm -f "$failed_state_file"
+      echo "Warning: Invalid brightness restore state: $brightness_state_file; continuing." >&2
+      return 0
       ;;
     esac
     case "$brightness" in
     '' | *[!0-9]*)
-      echo "Invalid brightness restore state: $brightness_state_file" >&2
-      return 1
+      rm -f "$failed_state_file"
+      echo "Warning: Invalid brightness restore state: $brightness_state_file; continuing." >&2
+      return 0
       ;;
     esac
     if [ -n "$extra" ] || [ "$brightness" -gt 100 ]; then
-      echo "Invalid brightness restore state: $brightness_state_file" >&2
-      return 1
+      rm -f "$failed_state_file"
+      echo "Warning: Invalid brightness restore state: $brightness_state_file; continuing." >&2
+      return 0
     fi
     if ! "$m1ddc" display "$selector" set luminance "$brightness" \
       >/dev/null 2>&1; then
-      failed=1
+      failed_entries=$((failed_entries + 1))
+      printf '%s %s\n' "$selector" "$brightness" >>"$failed_state_file"
     fi
   done <"$brightness_state_file"
 
-  if [ "$failed" -eq 0 ]; then
-    rm -f "$brightness_state_file"
+  if [ "$failed_entries" -eq 0 ]; then
+    rm -f "$brightness_state_file" "$failed_state_file"
     return 0
   fi
 
-  echo "Failed to restore external display brightness." >&2
-  return 1
+  if [ "$total_entries" -eq 1 ] &&
+    "$m1ddc" set luminance 50 >/dev/null 2>&1; then
+    rm -f "$brightness_state_file" "$failed_state_file"
+    echo "Restored the default external display brightness to 50%." >&2
+    return 0
+  fi
+
+  mv "$failed_state_file" "$brightness_state_file"
+  echo "Warning: Failed to restore external display brightness; continuing." >&2
+  return 0
 }
 
 build_binary() {
