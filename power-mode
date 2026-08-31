@@ -21,6 +21,8 @@ PSEUDO_SCREENSAVER_CONTROLLER="${PSEUDO_SCREENSAVER_CONTROLLER:-$script_dir/pseu
 NOSLEEP_TIMEOUT_HELPER="${NOSLEEP_TIMEOUT_HELPER:-$script_dir/nosleep_timeout.sh}"
 POWER_MODE_STATE_DIR="${POWER_MODE_STATE_DIR:-$HOME/Library/Caches/power-mode}"
 NOSLEEP_STATE_FILE="$POWER_MODE_STATE_DIR/nosleep.state"
+POWER_MODE_OPERATION_LOCK_FILE="$POWER_MODE_STATE_DIR/operation.lock"
+POWER_MODE_OPERATION_LOCK_HELD="${POWER_MODE_OPERATION_LOCK_HELD:-0}"
 AUTOMATIC_POWER_MODE=0
 LOW_POWER_MODE=1
 
@@ -109,6 +111,16 @@ ensure_not_root() {
     echo "sudo なしで実行してください。pmset だけ内部で sudo します。" >&2
     exit 1
   fi
+}
+
+acquire_operation_lock() {
+  if [ "$DRY_RUN" -eq 1 ] || [ "$POWER_MODE_OPERATION_LOCK_HELD" -eq 1 ]; then
+    return 0
+  fi
+
+  mkdir -p "$POWER_MODE_STATE_DIR"
+  exec 9>>"$POWER_MODE_OPERATION_LOCK_FILE"
+  /usr/bin/lockf 9
 }
 
 run() {
@@ -534,6 +546,10 @@ if [ "$PSEUDO_SCREENSAVER_SECONDS_OVERRIDE_SET" -eq 1 ]; then
 fi
 
 ensure_not_root
+
+if [ "$mode" != "status" ]; then
+  acquire_operation_lock
+fi
 
 case "$mode" in
 setup)
