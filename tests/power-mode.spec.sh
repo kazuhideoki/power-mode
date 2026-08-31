@@ -392,6 +392,46 @@ if [[ "$normal_output" == *'sudo '* ]] ||
   exit 1
 fi
 
+mkdir -p "$temporary_dir/operation-lock/bin"
+operation_lock_trace="$temporary_dir/operation-lock.trace"
+# shellcheck disable=SC2016
+# The generated script expands this variable at runtime.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf '\''start\n'\'' >>"$POWER_MODE_OPERATION_LOCK_TRACE"' \
+  '/bin/sleep 1' \
+  'printf '\''end\n'\'' >>"$POWER_MODE_OPERATION_LOCK_TRACE"' \
+  >"$temporary_dir/operation-lock/bin/defaults"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'exit 0' \
+  >"$temporary_dir/operation-lock/bin/killall"
+chmod +x \
+  "$temporary_dir/operation-lock/bin/defaults" \
+  "$temporary_dir/operation-lock/bin/killall"
+PATH="$temporary_dir/operation-lock/bin:$PATH" \
+  POWER_MODE_OPERATION_LOCK_TRACE="$operation_lock_trace" \
+  POWER_MODE_STATE_DIR="$temporary_dir/operation-lock/state" \
+  PSEUDO_SCREENSAVER_CONTROLLER=/usr/bin/true \
+  "$power_mode" normal >/dev/null &
+first_operation_pid=$!
+while [ ! -s "$operation_lock_trace" ]; do
+  sleep 0.05
+done
+PATH="$temporary_dir/operation-lock/bin:$PATH" \
+  POWER_MODE_OPERATION_LOCK_TRACE="$operation_lock_trace" \
+  POWER_MODE_STATE_DIR="$temporary_dir/operation-lock/state" \
+  PSEUDO_SCREENSAVER_CONTROLLER=/usr/bin/true \
+  "$power_mode" normal >/dev/null &
+second_operation_pid=$!
+wait "$first_operation_pid"
+wait "$second_operation_pid"
+if [ "$(<"$operation_lock_trace")" != $'start\nend\nstart\nend' ]; then
+  printf 'Assertion failed: mode-changing operations were not serialized\n%s\n' \
+    "$(<"$operation_lock_trace")" >&2
+  exit 1
+fi
+
 if POWER_MODE_STATE_DIR="$temporary_dir/state" \
   PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \
   "$power_mode" nosleep --dry-run \
@@ -468,6 +508,23 @@ assert_contains \
   "$(<"$nosleep_timeout_helper")" \
   '/usr/bin/pmset -a disablesleep 0 powermode 0' \
   'the nosleep timeout restores system sleep and automatic power mode'
+timeout_restore_block="$(
+  sed -n \
+    '\|/usr/bin/pmset -a disablesleep 0 powermode 0|,\|/bin/launchctl asuser|p' \
+    "$nosleep_timeout_helper"
+)"
+assert_contains \
+  "$timeout_restore_block" \
+  "rm -f \"\$state_file\"" \
+  'the nosleep timeout clears its state before returning to normal as the user'
+assert_contains \
+  "$(<"$nosleep_timeout_helper")" \
+  '/usr/bin/lockf 9' \
+  'the nosleep timeout serializes expiry with user mode changes'
+assert_contains \
+  "$(<"$nosleep_timeout_helper")" \
+  'POWER_MODE_OPERATION_LOCK_HELD=1' \
+  'the timeout normal transition reuses the lock held by its parent'
 
 rm -f "$temporary_dir/state/nosleep.state"
 nolock_after_nosleep_output="$(
