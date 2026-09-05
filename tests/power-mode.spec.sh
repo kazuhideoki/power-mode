@@ -39,6 +39,8 @@ export POWER_MODE_STATE_DIR
 cleanup() {
   POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/cache" \
     "$controller" stop >/dev/null 2>&1 || true
+  POWER_MODE_PSEUDO_CACHE_DIR="$temporary_dir/fd-inheritance-cache" \
+    "$controller" stop >/dev/null 2>&1 || true
   rm -rf "$temporary_dir"
 }
 trap cleanup EXIT
@@ -431,6 +433,45 @@ if [ "$(<"$operation_lock_trace")" != $'start\nend\nstart\nend' ]; then
     "$(<"$operation_lock_trace")" >&2
   exit 1
 fi
+
+fd_inheritance_cache="$temporary_dir/fd-inheritance-cache"
+fd_inheritance_lock="$temporary_dir/fd-inheritance.lock"
+mkdir -p "$fd_inheritance_cache"
+# shellcheck disable=SC2016
+# The generated script expands these variables at runtime.
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '' \
+  'stop_file=""' \
+  'while [ $# -gt 0 ]; do' \
+  '  case "$1" in' \
+  '  --stop-file)' \
+  '    stop_file="$2"' \
+  '    shift 2' \
+  '    ;;' \
+  '  *) shift ;;' \
+  '  esac' \
+  'done' \
+  '' \
+  'while [ ! -e "$stop_file" ]; do' \
+  '  sleep 0.05' \
+  'done' \
+  >"$fd_inheritance_cache/pseudo-screensaver"
+chmod +x "$fd_inheritance_cache/pseudo-screensaver"
+touch -t 209912312359 "$fd_inheritance_cache/pseudo-screensaver"
+(
+  exec 9>>"$fd_inheritance_lock"
+  /usr/bin/lockf 9
+  POWER_MODE_PSEUDO_CACHE_DIR="$fd_inheritance_cache" \
+    "$controller" start 300 >/dev/null
+)
+if ! /usr/bin/lockf -t 0 "$fd_inheritance_lock" /usr/bin/true; then
+  echo 'Assertion failed: pseudo screen saver inherited the operation lock' >&2
+  exit 1
+fi
+POWER_MODE_PSEUDO_CACHE_DIR="$fd_inheritance_cache" \
+  "$controller" stop >/dev/null
 
 if POWER_MODE_STATE_DIR="$temporary_dir/state" \
   PSEUDO_SCREENSAVER_CONTROLLER=/bin/echo \

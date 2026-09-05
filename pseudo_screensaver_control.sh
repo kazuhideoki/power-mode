@@ -236,7 +236,7 @@ start_app() {
     --idle-seconds "$idle_seconds" \
     --stop-file "$stop_file" \
     --brightness-state-file "$brightness_state_file" \
-    >>"$log_file" 2>&1 </dev/null &
+    >>"$log_file" 2>&1 </dev/null 9>&- &
   local pid=$!
   printf '%s\n' "$pid" >"$pid_file"
   printf '%s\n' "$idle_seconds" >"$idle_file"
