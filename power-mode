@@ -224,6 +224,7 @@ sleep_disabled_status() {
 }
 
 leave_nosleep_if_needed() {
+  [ "${POWER_MODE_NOSLEEP_RESTORE_DEFERRED:-0}" -eq 0 ] || return 0
   [ -f "$NOSLEEP_STATE_FILE" ] || return 0
 
   ensure_pmset_privileges
@@ -351,16 +352,16 @@ apply_mode() {
     fi
   fi
 
-  run defaults -currentHost write com.apple.screensaver idleTime -int "$screensaver_seconds"
+  run defaults -currentHost write com.apple.screensaver idleTime -int "$screensaver_seconds" || return $?
   flush_user_preferences
 
   case "$name" in
   nolock)
     run "$PSEUDO_SCREENSAVER_CONTROLLER" \
-      start "$NOLOCK_PSEUDO_SCREENSAVER_IDLE_SECONDS"
+      start "$NOLOCK_PSEUDO_SCREENSAVER_IDLE_SECONDS" || return $?
     ;;
   normal)
-    run "$PSEUDO_SCREENSAVER_CONTROLLER" stop
+    run "$PSEUDO_SCREENSAVER_CONTROLLER" stop || return $?
     ;;
   esac
 
@@ -385,7 +386,7 @@ apply_setup() {
   apply_mode \
     "normal" \
     "$NORMAL_SCREENSAVER_SECONDS" \
-    "Power mode: normal (setup complete)"
+    ""
 }
 
 apply_nosleep() {
@@ -441,13 +442,14 @@ apply_nosleep() {
 
   if ! sudo -b "$NOSLEEP_TIMEOUT_HELPER" \
     "$duration_seconds" "$token" "$NOSLEEP_STATE_FILE" \
-    "$(id -u)" "$(id -un)" "$HOME" "$script_dir/power-mode"; then
+    "$(id -u)" "$(id -un)" "$HOME" "$script_dir/power-mode" 9>&-; then
+    # Attempt cleanup before enabling sleep, but restore sleep even if it fails.
+    local cleanup_result=0
+    apply_mode "normal" "$NORMAL_SCREENSAVER_SECONDS" "" || cleanup_result=$?
     run_pmset -a disablesleep 0 powermode "$AUTOMATIC_POWER_MODE"
-    rm -f "$NOSLEEP_STATE_FILE"
-    apply_mode \
-      "normal" \
-      "$NORMAL_SCREENSAVER_SECONDS" \
-      "Power mode: normal (nosleep start failed)"
+    if [ "$cleanup_result" -eq 0 ]; then
+      rm -f "$NOSLEEP_STATE_FILE"
+    fi
     echo "nosleep の自動復帰タイマーを開始できませんでした。" >&2
     exit 1
   fi
@@ -553,22 +555,37 @@ fi
 
 case "$mode" in
 setup)
-  leave_nosleep_if_needed
   apply_setup
+  leave_nosleep_if_needed
+  if [ "$DRY_RUN" -eq 0 ]; then
+    echo "Power mode: normal (setup complete)"
+  fi
   ;;
 nolock)
-  leave_nosleep_if_needed
+  if [ -f "$NOSLEEP_STATE_FILE" ] && [ "${POWER_MODE_NOSLEEP_RESTORE_DEFERRED:-0}" -eq 0 ]; then
+    ensure_pmset_privileges
+  fi
   apply_mode \
     "nolock" \
     "$NOLOCK_SCREENSAVER_SECONDS" \
-    "Power mode: nolock"
+    ""
+  leave_nosleep_if_needed
+  if [ "$DRY_RUN" -eq 0 ]; then
+    echo "Power mode: nolock"
+  fi
   ;;
 normal)
-  leave_nosleep_if_needed
+  if [ -f "$NOSLEEP_STATE_FILE" ] && [ "${POWER_MODE_NOSLEEP_RESTORE_DEFERRED:-0}" -eq 0 ]; then
+    ensure_pmset_privileges
+  fi
   apply_mode \
     "normal" \
     "$NORMAL_SCREENSAVER_SECONDS" \
-    "Power mode: normal"
+    ""
+  leave_nosleep_if_needed
+  if [ "$DRY_RUN" -eq 0 ]; then
+    echo "Power mode: normal"
+  fi
   ;;
 nosleep)
   apply_nosleep "$NOSLEEP_DURATION_MINUTES"

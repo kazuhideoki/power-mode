@@ -549,15 +549,6 @@ assert_contains \
   "$(<"$nosleep_timeout_helper")" \
   '/usr/bin/pmset -a disablesleep 0 powermode 0' \
   'the nosleep timeout restores system sleep and automatic power mode'
-timeout_restore_block="$(
-  sed -n \
-    '\|/usr/bin/pmset -a disablesleep 0 powermode 0|,\|/bin/launchctl asuser|p' \
-    "$nosleep_timeout_helper"
-)"
-assert_contains \
-  "$timeout_restore_block" \
-  "rm -f \"\$state_file\"" \
-  'the nosleep timeout clears its state before returning to normal as the user'
 assert_contains \
   "$(<"$nosleep_timeout_helper")" \
   '/usr/bin/lockf 9' \
@@ -596,5 +587,164 @@ if [[ "$setup_output" == *'askForPassword'* ]] ||
     "$setup_output" >&2
   exit 1
 fi
+
+# Exercise startup without changing host power settings. The sudo stub checks
+# the descriptor before sudo itself could close it.
+mock_bin="$temporary_dir/nosleep-bin"
+mkdir -p "$mock_bin"
+cat >"$mock_bin/sudo" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+case "$1" in
+-n) exit 0 ;;
+-b)
+  if ( : >&9 ) 2>/dev/null; then
+    echo 'timer inherited FD 9' >&2
+    exit 1
+  fi
+  touch "$TEST_TIMER_STARTED"
+  ;;
+*) exit 0 ;;
+esac
+STUB
+for command in defaults killall; do
+  printf '#!/bin/sh\nexit 0\n' >"$mock_bin/$command"
+done
+chmod +x "$mock_bin"/*
+PATH="$mock_bin:$PATH" TEST_TIMER_STARTED="$temporary_dir/timer-started" \
+  POWER_MODE_STATE_DIR="$temporary_dir/start-state" \
+  PSEUDO_SCREENSAVER_CONTROLLER=/usr/bin/true \
+  "$power_mode" nosleep 1 >/dev/null
+test -f "$temporary_dir/timer-started"
+/usr/bin/lockf -k -t 0 "$temporary_dir/start-state/operation.lock" /usr/bin/true
+
+# Replace only privileged executable paths in a test copy of the real helper.
+# Keep its locking, token validation and control flow intact.
+cat >"$mock_bin/launchctl" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+printf 'normal\n' >>"$TEST_TRACE"
+test -f "$TEST_STATE"
+printf '%s\n' "$*" >"$TEST_ARGS"
+if [ "${TEST_NORMAL_EXIT:-0}" -ne 0 ]; then
+  exit "$TEST_NORMAL_EXIT"
+fi
+shift 6
+exec "$@"
+STUB
+cat >"$mock_bin/pmset" <<'STUB'
+#!/usr/bin/env bash
+printf 'enable-sleep\n' >>"$TEST_TRACE"
+exit "${TEST_PMSET_EXIT:-0}"
+STUB
+chmod +x "$mock_bin"/*
+sed -e "s|/bin/launchctl|$mock_bin/launchctl|g" \
+  -e "s|/usr/bin/pmset|$mock_bin/pmset|g" \
+  "$nosleep_timeout_helper" >"$temporary_dir/timeout-test.sh"
+export TEST_TRACE="$temporary_dir/timeout.trace"
+export TEST_ARGS="$temporary_dir/timeout.args"
+export TEST_STATE="$temporary_dir/start-state/nosleep.state"
+for scenario in success stale normal-failure pmset-failure; do
+  printf 'token\n9999999999\n' >"$TEST_STATE"
+  : >"$TEST_TRACE"
+  timer_token=token
+  normal_exit=0
+  pmset_exit=0
+  case "$scenario" in
+  stale) timer_token=old-token ;;
+  normal-failure) normal_exit=1 ;;
+  pmset-failure) pmset_exit=1 ;;
+  esac
+  result=0
+  PATH="$mock_bin:$PATH" PSEUDO_SCREENSAVER_CONTROLLER=/usr/bin/true \
+    TEST_NORMAL_EXIT="$normal_exit" TEST_PMSET_EXIT="$pmset_exit" \
+    bash "$temporary_dir/timeout-test.sh" 0 "$timer_token" "$TEST_STATE" \
+    "$(id -u)" "$(id -un)" "$HOME" "$power_mode" || result=$?
+  case "$scenario" in
+  success)
+    test "$result" -eq 0
+    test "$(cat "$TEST_TRACE")" = $'normal\nenable-sleep'
+    test ! -f "$TEST_STATE"
+    assert_contains "$(cat "$TEST_ARGS")" 'sudo -n -u' 'timer requires no interactive sudo'
+    assert_contains "$(cat "$TEST_ARGS")" 'POWER_MODE_NOSLEEP_RESTORE_DEFERRED=1' 'normal cleanup defers sleep restoration'
+    ;;
+  stale)
+    test "$result" -eq 0
+    test ! -s "$TEST_TRACE"
+    test -f "$TEST_STATE"
+    ;;
+  normal-failure)
+    test "$result" -ne 0
+    test "$(cat "$TEST_TRACE")" = $'normal\nenable-sleep'
+    test -f "$TEST_STATE"
+    ;;
+  pmset-failure)
+    test "$result" -ne 0
+    test -f "$TEST_STATE"
+    ;;
+  esac
+done
+
+# Check manual completion messages and rollback using the actual entrypoint.
+cat >"$mock_bin/sudo" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+-n) shift; exec "$@" ;;
+-b) exit 1 ;;
+*) exec "$@" ;;
+esac
+STUB
+cat >"$mock_bin/pmset" <<'STUB'
+#!/usr/bin/env bash
+printf 'pmset %s\n' "$*" >>"$TEST_TRACE"
+if [ "$*" = '-a disablesleep 0 powermode 0' ]; then
+  exit "${TEST_PMSET_EXIT:-0}"
+fi
+STUB
+cat >"$mock_bin/controller" <<'STUB'
+#!/usr/bin/env bash
+printf 'controller %s\n' "$*" >>"$TEST_TRACE"
+exit "${TEST_CONTROLLER_EXIT:-0}"
+STUB
+chmod +x "$mock_bin"/*
+for manual_mode in normal nolock setup; do
+  printf 'token\n9999999999\n' >"$TEST_STATE"
+  : >"$TEST_TRACE"
+  result=0
+  output="$(PATH="$mock_bin:$PATH" POWER_MODE_STATE_DIR="${TEST_STATE%/*}" \
+    PSEUDO_SCREENSAVER_CONTROLLER="$mock_bin/controller" TEST_PMSET_EXIT=1 \
+    "$power_mode" "$manual_mode" 2>&1)" || result=$?
+  test "$result" -ne 0
+  test -f "$TEST_STATE"
+  assert_not_contains "$output" 'Power mode:' 'failed manual restore does not report success'
+done
+for controller_exit in 0 1; do
+  : >"$TEST_TRACE"
+  result=0
+  PATH="$mock_bin:$PATH" POWER_MODE_STATE_DIR="${TEST_STATE%/*}" \
+    PSEUDO_SCREENSAVER_CONTROLLER="$mock_bin/controller" \
+    TEST_CONTROLLER_EXIT=0 TEST_PMSET_EXIT=0 \
+    "$power_mode" normal >/dev/null
+  : >"$TEST_TRACE"
+  # Fail only stop so startup reaches the timer creation failure.
+  cat >"$mock_bin/controller" <<'STUB'
+#!/usr/bin/env bash
+printf 'controller %s\n' "$*" >>"$TEST_TRACE"
+if [ "$1" = stop ]; then
+  exit "${TEST_CONTROLLER_EXIT:-0}"
+fi
+STUB
+  PATH="$mock_bin:$PATH" POWER_MODE_STATE_DIR="${TEST_STATE%/*}" \
+    PSEUDO_SCREENSAVER_CONTROLLER="$mock_bin/controller" \
+    TEST_CONTROLLER_EXIT="$controller_exit" TEST_PMSET_EXIT=0 \
+    "$power_mode" nosleep 1 >"$temporary_dir/start-failure.out" 2>&1 || result=$?
+  test "$result" -ne 0
+  test "$(tail -2 "$TEST_TRACE")" = $'controller stop\npmset -a disablesleep 0 powermode 0'
+  if [ "$controller_exit" -eq 0 ]; then
+    test ! -f "$TEST_STATE"
+  else
+    test -f "$TEST_STATE"
+  fi
+done
 
 echo 'power_mode tests passed.'
