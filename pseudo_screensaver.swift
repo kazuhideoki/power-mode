@@ -328,7 +328,7 @@ private final class BouncingClockView: NSView {
     }
 
     private func startAnimation() {
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.advanceFrame()
             }
@@ -339,7 +339,7 @@ private final class BouncingClockView: NSView {
 
     private func advanceFrame() {
         let now = ProcessInfo.processInfo.systemUptime
-        let elapsed = min(now - lastFrameTime, 0.1)
+        let elapsed = min(now - lastFrameTime, 1.0)
         lastFrameTime = now
 
         position.x += velocity.dx * elapsed
