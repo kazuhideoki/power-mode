@@ -19,6 +19,11 @@ NOSLEEP_DURATION_MINUTES=""
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSEUDO_SCREENSAVER_CONTROLLER="${PSEUDO_SCREENSAVER_CONTROLLER:-$script_dir/pseudo_screensaver_control.sh}"
 NOSLEEP_TIMEOUT_HELPER="${NOSLEEP_TIMEOUT_HELPER:-$script_dir/nosleep_timeout.sh}"
+LAUNCHCTL="${POWER_MODE_LAUNCHCTL:-/bin/launchctl}"
+LOCKAWAKE_LABEL="com.kazuhideoki.power-mode.lockawake"
+LOCKAWAKE_DOMAIN="gui/$(id -u)"
+LOCKAWAKE_SERVICE="$LOCKAWAKE_DOMAIN/$LOCKAWAKE_LABEL"
+LOCKAWAKE_PLIST="$script_dir/$LOCKAWAKE_LABEL.plist"
 POWER_MODE_STATE_DIR="${POWER_MODE_STATE_DIR:-$HOME/Library/Caches/power-mode}"
 NOSLEEP_STATE_FILE="$POWER_MODE_STATE_DIR/nosleep.state"
 POWER_MODE_OPERATION_LOCK_FILE="$POWER_MODE_STATE_DIR/operation.lock"
@@ -28,20 +33,21 @@ LOW_POWER_MODE=1
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [setup|nolock|normal|nosleep MINUTES|status] [options]
+Usage: $(basename "$0") [setup|auto|awake|awake-remote|awake-lid-closed MINUTES|status] [options]
 
 Modes:
-  setup    通常時の電源設定を初回または変更時に反映する（sudo が必要）
-  nolock   アイドル時のスリープと標準スクリーンセーバー経由のロックを抑止する
-  nosleep  nolock に加え、低電力モードで蓋を閉じた時のスリープも指定時間だけ無効化する（sudo が必要）
-  normal   普段使い向け。15 分後にスクリーンセーバー、その後にスリープ/ロックする
-  status   現在のモードを表示する（省略時の既定値）
+  auto              普段使い向け。ロック、消灯、スリープは通常設定に従う
+  awake             画面ロックと消灯を許可し、本体のアイドルスリープを抑止する
+  awake-remote      自動消灯と標準スクリーンセーバーも抑止し、離席中の GUI 操作を維持する
+  awake-lid-closed  低電力モードで蓋を閉じた時のスリープも指定時間だけ無効化する（sudo が必要）
+  setup             通常時の電源設定を初回または変更時に反映する（sudo が必要）
+  status            現在のモードを表示する（省略時の既定値）
 
 Options:
   --detail
            status の関連設定も表示する
   --pseudo-screensaver-seconds SECONDS
-           nolock の擬似スクリーンセーバー起動までの時間を秒で上書きする
+           awake-remote の擬似スクリーンセーバー起動までの時間を秒で上書きする
   -n, --dry-run
            変更内容だけを表示する
 
@@ -57,8 +63,8 @@ Environment overrides:
 
 Notes:
   setup の pmset 変更には sudo が必要です。
-  nosleep への切り替えと、時間前に nosleep から抜ける操作には sudo が必要です。
-  nolock / normal の切り替えには sudo やパスワード入力は不要です。
+  awake-lid-closed への切り替えと、指定時間より前に解除する操作には sudo が必要です。
+  auto / awake / awake-remote 間の切り替えには sudo やパスワード入力は不要です。
   PMSET_SCOPE は -a(all), -c(AC power), -b(battery) のいずれかです。
 EOF
 }
@@ -169,7 +175,7 @@ ensure_pmset_privileges() {
   fi
 
   echo "pmset の変更には sudo が必要ですが、現在の実行環境には対話 TTY がありません。" >&2
-  echo "Terminal など対話可能なシェルから再実行してください: power-mode ${mode:-normal}" >&2
+  echo "Terminal など対話可能なシェルから再実行してください: power-mode ${mode:-auto}" >&2
   exit 1
 }
 
@@ -234,6 +240,22 @@ leave_nosleep_if_needed() {
   fi
 }
 
+lockawake_is_active() {
+  "$LAUNCHCTL" print "$LOCKAWAKE_SERVICE" >/dev/null 2>&1
+}
+
+start_lockawake() {
+  if ! lockawake_is_active; then
+    run "$LAUNCHCTL" bootstrap "$LOCKAWAKE_DOMAIN" "$LOCKAWAKE_PLIST"
+  fi
+}
+
+stop_lockawake() {
+  if lockawake_is_active; then
+    run "$LAUNCHCTL" bootout "$LOCKAWAKE_SERVICE"
+  fi
+}
+
 screen_lock_status() {
   local output
 
@@ -269,7 +291,12 @@ detect_power_mode() {
   local current_screensaver_seconds
 
   if [ -f "$NOSLEEP_STATE_FILE" ] && [ "$(sleep_disabled_status)" = "Yes" ]; then
-    echo "nosleep"
+    echo "awake-lid-closed"
+    return 0
+  fi
+
+  if lockawake_is_active; then
+    echo "awake"
     return 0
   fi
 
@@ -293,7 +320,7 @@ detect_power_mode() {
       "$current_display_sleep_minutes" \
       "$current_disk_sleep_minutes" &&
     [ "$current_screensaver_seconds" = "$NOLOCK_SCREENSAVER_SECONDS" ]; then
-    echo "nolock"
+    echo "awake-remote"
   elif ! "$PSEUDO_SCREENSAVER_CONTROLLER" status 2>/dev/null | rg -q '^running' &&
     matches_normal_power_settings \
       "$NORMAL_SLEEP_MINUTES" \
@@ -303,7 +330,7 @@ detect_power_mode() {
       "$current_display_sleep_minutes" \
       "$current_disk_sleep_minutes" &&
     [ "$current_screensaver_seconds" = "$NORMAL_SCREENSAVER_SECONDS" ]; then
-    echo "normal"
+    echo "auto"
   else
     echo "custom"
   fi
@@ -332,7 +359,7 @@ print_status() {
   "$PSEUDO_SCREENSAVER_CONTROLLER" status 2>/dev/null || echo "unknown"
   printf '%-36s %s\n' "sleepDisabled:" "$(sleep_disabled_status)"
   if [ -f "$NOSLEEP_STATE_FILE" ]; then
-    printf '%-36s %s\n' "nosleepUntil(epoch):" "$(nosleep_state_deadline)"
+    printf '%-36s %s\n' "awakeLidClosedUntil(epoch):" "$(nosleep_state_deadline)"
   fi
 }
 
@@ -395,7 +422,7 @@ apply_nosleep() {
   local deadline
   local token
 
-  validate_positive_integer "nosleep の継続時間（分）" "$duration_minutes"
+  validate_positive_integer "awake-lid-closed の継続時間（分）" "$duration_minutes"
   duration_seconds=$((duration_minutes * 60))
   ensure_pmset_privileges
 
@@ -411,6 +438,7 @@ apply_nosleep() {
     run sudo -b "$NOSLEEP_TIMEOUT_HELPER" \
       "$duration_seconds" "$token" "$NOSLEEP_STATE_FILE" \
       "$(id -u)" "$(id -un)" "$HOME" "$script_dir/power-mode"
+    stop_lockawake
     return 0
   fi
 
@@ -424,7 +452,7 @@ apply_nosleep() {
     apply_mode \
       "normal" \
       "$NORMAL_SCREENSAVER_SECONDS" \
-      "Power mode: normal (nosleep start failed)"
+      "Power mode: auto (awake-lid-closed start failed)"
     echo "低電力モードを有効化できませんでした。" >&2
     exit 1
   fi
@@ -435,7 +463,7 @@ apply_nosleep() {
     apply_mode \
       "normal" \
       "$NORMAL_SCREENSAVER_SECONDS" \
-      "Power mode: normal (nosleep start failed)"
+      "Power mode: auto (awake-lid-closed start failed)"
     echo "蓋を閉じた時のスリープを無効化できませんでした。" >&2
     exit 1
   fi
@@ -450,27 +478,34 @@ apply_nosleep() {
     if [ "$cleanup_result" -eq 0 ]; then
       rm -f "$NOSLEEP_STATE_FILE"
     fi
-    echo "nosleep の自動復帰タイマーを開始できませんでした。" >&2
+    echo "awake-lid-closed の自動復帰タイマーを開始できませんでした。" >&2
     exit 1
   fi
 
-  echo "Power mode: nosleep (${duration_minutes}m)"
+  stop_lockawake
+  echo "Power mode: awake-lid-closed (${duration_minutes}m)"
 }
 
 mode=""
 while [ $# -gt 0 ]; do
   case "$1" in
-  setup | nolock | normal | nosleep | status)
+  setup | auto | awake | awake-remote | awake-lid-closed | status | normal | lockawake | nolock | nosleep)
     if [ -n "$mode" ]; then
       echo "mode は1つだけ指定してください: $mode と $1" >&2
       usage >&2
       exit 1
     fi
-    mode="$1"
+    case "$1" in
+    normal) mode="auto" ;;
+    lockawake) mode="awake" ;;
+    nolock) mode="awake-remote" ;;
+    nosleep) mode="awake-lid-closed" ;;
+    *) mode="$1" ;;
+    esac
     shift
-    if [ "$mode" = "nosleep" ]; then
+    if [ "$mode" = "awake-lid-closed" ]; then
       if [ $# -eq 0 ] || [[ "$1" = -* ]]; then
-        echo "nosleep には継続時間（分）が必要です。" >&2
+        echo "awake-lid-closed には継続時間（分）が必要です。" >&2
         usage >&2
         exit 1
       fi
@@ -532,8 +567,8 @@ if [ "$DETAIL" -eq 1 ] && [ "$mode" != "status" ]; then
 fi
 
 if [ "$PSEUDO_SCREENSAVER_SECONDS_OVERRIDE_SET" -eq 1 ]; then
-  if [ "$mode" != "nolock" ]; then
-    echo "--pseudo-screensaver-seconds は nolock でのみ指定できます。" >&2
+  if [ "$mode" != "awake-remote" ]; then
+    echo "--pseudo-screensaver-seconds は awake-remote でのみ指定できます。" >&2
     usage >&2
     exit 1
   fi
@@ -557,11 +592,12 @@ case "$mode" in
 setup)
   apply_setup
   leave_nosleep_if_needed
+  stop_lockawake
   if [ "$DRY_RUN" -eq 0 ]; then
-    echo "Power mode: normal (setup complete)"
+    echo "Power mode: auto (setup complete)"
   fi
   ;;
-nolock)
+awake-remote)
   if [ -f "$NOSLEEP_STATE_FILE" ] && [ "${POWER_MODE_NOSLEEP_RESTORE_DEFERRED:-0}" -eq 0 ]; then
     ensure_pmset_privileges
   fi
@@ -570,11 +606,12 @@ nolock)
     "$NOLOCK_SCREENSAVER_SECONDS" \
     ""
   leave_nosleep_if_needed
+  stop_lockawake
   if [ "$DRY_RUN" -eq 0 ]; then
-    echo "Power mode: nolock"
+    echo "Power mode: awake-remote"
   fi
   ;;
-normal)
+awake | auto)
   if [ -f "$NOSLEEP_STATE_FILE" ] && [ "${POWER_MODE_NOSLEEP_RESTORE_DEFERRED:-0}" -eq 0 ]; then
     ensure_pmset_privileges
   fi
@@ -583,11 +620,16 @@ normal)
     "$NORMAL_SCREENSAVER_SECONDS" \
     ""
   leave_nosleep_if_needed
+  if [ "$mode" = "awake" ]; then
+    start_lockawake
+  else
+    stop_lockawake
+  fi
   if [ "$DRY_RUN" -eq 0 ]; then
-    echo "Power mode: normal"
+    echo "Power mode: $mode"
   fi
   ;;
-nosleep)
+awake-lid-closed)
   apply_nosleep "$NOSLEEP_DURATION_MINUTES"
   ;;
 status)
